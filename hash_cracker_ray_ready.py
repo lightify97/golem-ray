@@ -9,6 +9,12 @@ import ray
 
 ray.init()
 
+
+# some great reads about ray's wait API:
+# https://medium.com/distributed-computing-with-ray/ray-tips-and-tricks-part-i-ray-wait-9ed7a0b9836d
+# https://rise.cs.berkeley.edu/blog/ray-tips-for-first-time-users/
+
+
 # some sample phrases to crack
 #
 # 'G0!3m':   070063ad89872aaa0fc0a2f170be5641e9c5d201d25b76703a4be3ee3848016c
@@ -55,7 +61,6 @@ parser.add_argument("hash", type=str)
 args = parser.parse_args()
 
 
-@ray.remote
 def str_to_int(value: str) -> int:
     """
     Convert a string to its numerical value.
@@ -78,7 +83,6 @@ def str_to_int(value: str) -> int:
     return intval
 
 
-@ray.remote
 def int_to_str(intval: int, round_nulls=False) -> Optional[str]:
     """
     Convert an integer value back to the equivalent string.
@@ -126,44 +130,52 @@ def scan_range(searched_hash: str, start: int, end: int) -> Optional[str]:
     """
 
     print(
-        f"scanning: {searched_hash}: {ray.get(int_to_str.remote(start, True))}, {ray.get(int_to_str.remote(end, True))}",
+        f"scanning: {searched_hash}: {int_to_str(start, True)}, {int_to_str(end, True)}",
     )
     for i in range(start, end):
-        word = ray.get(int_to_str.remote(i))
+        word = int_to_str(i)
         if word:
             word_hash = sha256(bytes(word, "utf-8")).hexdigest()
             if word_hash == searched_hash:
                 return word
 
 
-result = None
-
 # we start with a string consisting of a single, first character from the character set
 # e.g. `a`
-start_space = ray.get(str_to_int.remote(CHARS[0]))
+start_space = str_to_int(CHARS[0])
 
 # we traverse until a string consisting of the last character from the set, repeated `length` times
 # since a range doesn't contain its upper extent, we specify the next "number"
 # which is a string consisting of `length`+1 of the first character
 # e.g. `aaaa` when the length if equal to 3
-end_space = ray.get(str_to_int.remote(CHARS[0] * (args.length + 1)))
+end_space = str_to_int(CHARS[0] * (args.length + 1))
 
 # round the chunk size up so that at most the specified number of chunks
 # is required to cover the whole range
 chunk_size = math.ceil((end_space - start_space) / args.num_chunks)
+
+results = []
 
 for c in range(0, args.num_chunks):
     # we don't want to search beyond the end of the range,
     # so we clamp the start/end values to the whole range's bounds
     start_chunk = min(end_space, start_space + c * chunk_size)
     end_chunk = min(end_space, start_chunk + chunk_size)
+    # asynchronously submit all the jobs without waiting for any of them to complete
+    # the scan_range function is our hotspot, so we want to parallelize it as much as possible
     chunk_result = scan_range.remote(args.hash, start_chunk, end_chunk)
-    if chunk_result:
-        result = ray.get(chunk_result)
-        break
+    # add object ids of all the jobs to the list
+    results.append(chunk_result)
+    # the below code was in the original version, it was blocking and didn't allow for parallelization
+    # if chunk_result:
+    #     result = ray.get(chunk_result)
+    #     break
 
+# we only need the first result, so we synchronously wait for it to complete
+completed, _ = ray.wait(results, num_returns=1)
 
-print(
-    f"finished in {datetime.now() - start_time},",
-    f"match found: {result}" if result else f"match not found",
-)
+if completed:
+    print(
+        f"finished in {datetime.now() - start_time},",
+        f"match found: {ray.get(completed)[0]}" if completed else f"match not found",
+    )
